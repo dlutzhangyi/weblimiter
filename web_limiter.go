@@ -1,69 +1,68 @@
 package weblimiter
 
 import (
-	"encoding/json"
 	"reflect"
 	"sync"
-	"time"
 
-	log "github.com/Sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 )
+
 type WebLimiter struct {
 	mux *sync.RWMutex
 	//rateConfMap stores the value of limiting rules
-	rateConfs []RateConf
-	//configCenter stores the value of limiting rules,
-	//it could be etcd,zk...
-	configCenter ConfigCenter
+	rateConfig []RateConf
+	//client is used to get limiting rules from config center,like zk,etcd,redis..
+	client ConfigClient
 	//key defines the key in configCentor,
 	// and the return value is limiting rules
-	key      string
-	interval time.Duration
+	key string
+	//limiters for rate limit
 	limiters []*TokenRateLimiter
-	confsChan chan []RateConf
-	notifyLimiterMsg   func(msg string) error
+	//rateConfChan stores the value get from client, once the client the new rateconfig,
+	//it put the config into rateConfChan
+	rateConfChan chan []RateConf
+	//notifyMsg is used to notify the msg for the change of rateConf
+	notifyMsg func(msg string) error
 }
 
-func NewWebLimiter(config ConfigCenter, key string,interval time.Duration) *WebLimiter {
+func NewWebLimiter(client ConfigClient, key string) *WebLimiter {
 	mux := new(sync.RWMutex)
 	return &WebLimiter{
-		mux:          mux,
-		key:          key,
-		configCenter: config,
-		interval:	interval,
+		mux:    mux,
+		key:    key,
+		client: client,
 	}
 }
 
 func (limiter *WebLimiter) Init() {
-	confs,err:=limiter.getConfsFromConfigCenter()
-	if err!=nil{
-		log.Errorf("get confs from config center error:%s",err)
+	rateConfig, err := limiter.getAndParseConfig()
+	if err != nil {
+		log.Fatalf("get and parse config err:%s", err)
 	}
-	pconfs,err:=limiter.parseConfs(confs)
-	if err!=nil{
-		log.Errorf("parse confs error:%s")
-	}
-	limiters:=limiter.makeLimiters(pconfs)
+
+	limiters := limiter.makeLimiters(rateConfig)
 	limiter.limiters = limiters
-	limiter.rateConfs = pconfs
+	limiter.rateConfig = rateConfig
 
 	go limiter.Daemon()
 }
 
-func (limiter *WebLimiter) Daemon(){
-	ticker := time.NewTicker(limiter.interval)
-	defer ticker.Stop()
+func (limiter *WebLimiter) getAndParseConfig() ([]RateConf, error) {
+	config, err := limiter.client.GetConfig(limiter.key)
+	if err != nil {
+		return nil, err
+	}
+	return limiter.client.ParseConfig(config)
+}
+
+func (limiter *WebLimiter) Daemon() {
 	for {
 		select {
-		case <- ticker.C:
-			newConfs,err:= limiter.getAndParseConfs()
-			if err!=nil{
-				continue
-			}
-			if !limiter.compareConfs(newConfs){
-				limiter.rateConfs=newConfs
-				limiters := limiter.makeLimiters(newConfs)
+		case config := <-limiter.rateConfChan:
+			if !limiter.compareConfig(config) {
+				limiters := limiter.makeLimiters(config)
 				limiter.mux.Lock()
+				limiter.rateConfig = config
 				limiter.limiters = limiters
 				limiter.mux.Unlock()
 			}
@@ -71,48 +70,17 @@ func (limiter *WebLimiter) Daemon(){
 	}
 }
 
-func (limiter *WebLimiter) getAndParseConfs() ([]RateConf,error){
-	confs,err:=limiter.getConfsFromConfigCenter()
-	if err!=nil{
-		return nil,err
-	}
-	return limiter.parseConfs(confs)
+// compare the new config with the last config,if same,then return
+func (limiter *WebLimiter) compareConfig(newConfs []RateConf) bool {
+	return compareRateConf(limiter.rateConfs, newConfs)
 }
 
-func (limiter *WebLimiter) compareConfs(newConfs []RateConf) bool {
-	if !compareRateConf(limiter.rateConfs,newConfs) {
-		return false
-	}
-
-	return true
-}
-
-func (limiter *WebLimiter) getConfsFromConfigCenter() (map[string]string, error) {
-	config := limiter.configCenter
-	key := limiter.key
-	confs, err := config.GetConfig(key)
-	if err!=nil{
-		return nil,err
-	}
-	dump:=make(map[string]string)
-	if err:= json.Unmarshal([]byte(confs),&dump);err!=nil{
-		return nil,err
-	}
-	return dump,nil
-}
-
-func (limiter *WebLimiter) parseConfs(confs map[string]string) ([]RateConf,error){
-	rateConfs := []RateConf{}
-	return rateConfs,nil
-}
-
-func (limiter *WebLimiter) makeLimiters(rateConfs []RateConf) []*TokenRateLimiter{
-	rateLimiter :=NewTokenRateLimiter(rateConfs)
+func (limiter *WebLimiter) makeLimiters(rateConfs []RateConf) []*TokenRateLimiter {
+	rateLimiter := NewTokenRateLimiter(rateConfs)
 	return []*TokenRateLimiter{rateLimiter}
 }
 
-
-func compareRateConf(old,new []RateConf) bool{
+func compareRateConf(old, new []RateConf) bool {
 	oldMap := make(map[string]float64)
 	newMap := make(map[string]float64)
 	for _, conf := range old {
