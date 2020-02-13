@@ -43,6 +43,7 @@ func (limiter *WebLimiter) Init() {
 	limiters := limiter.makeLimiters(rateConfig)
 	limiter.limiters = limiters
 	limiter.rateConfig = rateConfig
+	limiter.client.RegisterConfigChannel(limiter.rateConfChan)
 
 	go limiter.Daemon()
 }
